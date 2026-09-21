@@ -167,6 +167,10 @@ export function createGSDExtensionAPI(
     registerTool: ((tool: any) => pi.registerTool(tool)) as ExtensionAPI["registerTool"],
     registerCommand: (...args: Parameters<ExtensionAPI["registerCommand"]>) =>
       pi.registerCommand(...args),
+    registerPreparationGuard: (...args: Parameters<ExtensionAPI["registerPreparationGuard"]>) =>
+      pi.registerPreparationGuard(...args),
+    registerPreparationCommand: (...args: Parameters<ExtensionAPI["registerPreparationCommand"]>) =>
+      pi.registerPreparationCommand(...args),
     registerBeforeInstall: (...args: Parameters<ExtensionAPI["registerBeforeInstall"]>) =>
       pi.registerBeforeInstall(...args),
     registerAfterInstall: (...args: Parameters<ExtensionAPI["registerAfterInstall"]>) =>

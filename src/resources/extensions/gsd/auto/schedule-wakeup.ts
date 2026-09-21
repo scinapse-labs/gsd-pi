@@ -1,6 +1,8 @@
 // Project/App: gsd-pi
 // File Purpose: Auto-mode ScheduleWakeup state shared between the tool and runUnit.
 
+import { preparationFence } from "../preparation-fence.js";
+
 export interface ScheduledWakeup {
   basePath: string;
   unitType: string;
@@ -16,8 +18,10 @@ function wakeupKey(basePath: string, unitType: string, unitId: string): string {
 }
 
 const pendingWakeups = new Map<string, ScheduledWakeup>();
+export function hasPendingAutoWakeups(): boolean { return pendingWakeups.size > 0; }
 
 export function scheduleAutoWakeup(wakeup: ScheduledWakeup): void {
+  preparationFence.assertExecutionAllowed();
   pendingWakeups.set(
     wakeupKey(wakeup.basePath, wakeup.unitType, wakeup.unitId),
     wakeup,

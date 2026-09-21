@@ -40,6 +40,8 @@ import type {
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	PreparationGuard,
+	PreparationCommandOptions,
 	RuntimeReadHandler,
 	ToolDefinition,
 } from "./types.js";
@@ -286,6 +288,26 @@ function createExtensionAPI(
 			});
 		},
 
+		registerPreparationGuard(name: string, guard: PreparationGuard): void {
+			runtime.assertActive();
+			if (!name.trim() || typeof guard.acquire !== "function") throw new Error("Invalid preparation guard");
+			extension.preparationGuards ??= new Map();
+			if (extension.preparationGuards.has(name)) throw new Error(`Duplicate preparation guard: ${name}`);
+			extension.preparationGuards.set(name, guard);
+		},
+
+		registerPreparationCommand(name: string, options: PreparationCommandOptions): void {
+			runtime.assertActive();
+			if (!name.trim() || !options.guard.trim() || typeof options.prepare !== "function") {
+				throw new Error("Invalid preparation command");
+			}
+			extension.commands.set(name, {
+				name, sourceInfo: extension.sourceInfo, description: options.description,
+				preparation: Object.freeze({ ...options }),
+				handler: async () => { throw new Error("Preparation commands require host admission"); },
+			});
+		},
+
 		registerShortcut(
 			shortcut: KeyId,
 			options: {
@@ -472,6 +494,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		flags: new Map(),
 		shortcuts: new Map(),
 		runtimeReadHandlers: new Map(),
+		preparationGuards: new Map(),
 	};
 }
 

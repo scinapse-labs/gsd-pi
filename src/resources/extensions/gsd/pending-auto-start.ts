@@ -3,6 +3,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent";
 import { createWorkspace, scopeMilestone, type MilestoneScope } from "./workspace.js";
+import { preparationFence } from "./preparation-fence.js";
 
 export interface PendingAutoStartEntry {
   ctx: ExtensionCommandContext;
@@ -43,6 +44,7 @@ export function hasPendingAutoStart(basePath?: string): boolean {
 }
 
 export function setPendingAutoStart(basePath: string, entry: PendingAutoStartInput): void {
+  preparationFence.assertExecutionAllowed();
   if (!entry.ctx || !entry.pi) {
     throw new Error("setPendingAutoStart requires ctx and pi");
   }

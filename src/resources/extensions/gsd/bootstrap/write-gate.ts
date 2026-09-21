@@ -1,5 +1,5 @@
 // gsd-pi - Write gate runtime persistence and policy guards.
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { minimatch } from "minimatch";
@@ -14,6 +14,7 @@ import {
   isReadOnlyPlanningDispatchAgent,
 } from "../planning-subagent-registry.js";
 import { logWarning } from "../workflow-logger.js";
+import { preparationFence } from "../preparation-fence.js";
 import { acquireSyncLock, releaseSyncLock } from "../sync-lock.js";
 import { isGsdWorktreePath, resolveWorktreeProjectRoot } from "../worktree-root.js";
 import { worktreesDirs } from "../worktree-placement.js";
@@ -101,6 +102,40 @@ function createEmptyWriteGateState(): InMemoryWriteGateState {
 }
 
 const writeGateStatesByBasePath = new Map<string, InMemoryWriteGateState>();
+/** Preparation must observe, never reconcile or reset another operation's state. */
+export function hasPendingWriteGateWork(basePath: string): boolean {
+  const roots = new Set([writeGateStateKey(basePath), ...writeGateStatesByBasePath.keys()]);
+  for (const root of roots) {
+    const cached = writeGateStatesByBasePath.get(root);
+    if (cached && (cached.activeQueuePhase || cached.pendingGateId !== null)) return true;
+    if (!shouldPersistWriteGateSnapshot()) continue;
+    const path = writeGateSnapshotPath(root);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(path, "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        // A genuinely absent snapshot is normal. A dangling snapshot symlink
+        // exists but is unreadable, so it must not be interpreted as idle.
+        try { lstatSync(path); } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw statError;
+        }
+      }
+      throw error;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("Preparation cannot determine persisted write-gate state");
+    }
+    const state = raw as Record<string, unknown>;
+    if (typeof state.activeQueuePhase !== "boolean" ||
+        !(state.pendingGateId === null || typeof state.pendingGateId === "string")) {
+      throw new Error("Preparation cannot determine persisted write-gate state");
+    }
+    if (state.activeQueuePhase || state.pendingGateId !== null) return true;
+  }
+  return false;
+}
 
 /**
  * Write-gate snapshots are project-scoped, not worktree-scoped. When auto-mode
@@ -494,6 +529,7 @@ export function isQueuePhaseActive(basePath: string = process.cwd()): boolean {
 }
 
 export function setQueuePhaseActive(active: boolean, basePath: string): void {
+  if (active) preparationFence.assertExecutionAllowed();
   mutateWriteGateState(basePath, (state) => {
     state.activeQueuePhase = active;
   });
@@ -577,6 +613,7 @@ export function setPendingGate(gateId: string, basePath: string): boolean {
 
 /** Arm `gateId` on a reconciled state, revoking its prior verification. */
 function armPendingGate(state: InMemoryWriteGateState, gateId: string): void {
+  preparationFence.assertExecutionAllowed();
   state.pendingGateId = gateId;
   state.verifiedApprovalGates.delete(gateId);
   const milestoneId = extractDepthVerificationMilestoneId(gateId);

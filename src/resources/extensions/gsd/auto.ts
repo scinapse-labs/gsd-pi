@@ -21,6 +21,7 @@ import type {
 } from "@gsd/pi-coding-agent";
 
 import { deriveState, invalidateStateCache } from "./state.js";
+import { preparationFence } from "./preparation-fence.js";
 import {
   buildRequirementsBacklogSummaryLines,
   countUnmappedActiveRequirements,
@@ -2634,6 +2635,13 @@ export async function startAuto(
     resumeWedgeId?: string | null;
   },
 ): Promise<void> {
+  return preparationFence.runExecution("auto-start-or-resume", () =>
+    startAutoImplementation(ctx, pi, base, verboseMode, options));
+}
+
+async function startAutoImplementation(...args: Parameters<typeof startAuto>): Promise<void> {
+  const [ctx, pi, initialBase, verboseMode, options] = args;
+  let base = initialBase;
   if (s.active) {
     debugLog("startAuto", { phase: "already-active", skipping: true });
     return;

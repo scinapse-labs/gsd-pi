@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { startAutoDetached } from "./auto.js";
+import { preparationFence } from "./preparation-fence.js";
 import { extractDepthVerificationMilestoneId, getPendingGate } from "./bootstrap/write-gate.js";
 import { getMilestone, insertMilestone, insertArtifact, isDbAvailable } from "./gsd-db.js";
 import { getMilestoneScopedArtifacts } from "./db/queries.js";
@@ -43,15 +44,30 @@ export function scheduleAutoStartAfterIdle(
     typeof (ctx as { waitForIdle?: unknown }).waitForIdle === "function"
       ? ctx.waitForIdle.bind(ctx)
       : async () => {};
-  void waitForIdle()
-    .then(() => {
-      setTimeout(() => launch(ctx, pi, basePath, verboseMode, options), 0);
-    })
+  const reservation = preparationFence.reserveExecution("discussion-idle-handoff");
+  let idle: Promise<void>;
+  try {
+    idle = waitForIdle();
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
+  void idle
+    .then(() => new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        try {
+          Promise.resolve(launch(ctx, pi, basePath, verboseMode, options)).then(resolve, reject);
+        } catch (error) {
+          reject(error);
+        }
+      }, 0);
+    }))
     .catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       ctx.ui.notify(`Auto-start failed while waiting for the prior turn to settle: ${message}`, "error");
       logWarning("guided", `auto-start idle wait failed: ${message}`);
-    });
+    })
+    .finally(() => reservation.release());
 }
 
 function manifestContainsMilestone(basePath: string, milestoneId: string): boolean {

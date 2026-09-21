@@ -9,6 +9,7 @@ import { stripFrontmatter } from "@gsd/pi-coding-agent/utils/frontmatter.js";
 import { sleep } from "@gsd/pi-coding-agent/utils/sleep.js";
 import type { PromptOptions } from "./agent-session-types.js";
 import type { AgentSessionHost } from "./agent-session-host.js";
+import type { PreparationCommandOptions, PreparationLease } from "@gsd/pi-coding-agent/core/extensions/types.js";
 
 type NoProgressTerminalRetryFingerprint = {
 	errorKind: "terminated" | "timeout";
@@ -18,10 +19,78 @@ type NoProgressTerminalRetryFingerprint = {
 
 export class AgentSessionPromptModule {
 	private lastNoProgressTerminalRetry: NoProgressTerminalRetryFingerprint | undefined;
+	private preparationOwner: { aborted: boolean; dispatched: boolean; assertCurrent?: () => void } | undefined;
+	private promptsInFlight = 0;
+
+	assertPreparationAccess(permit?: object): void {
+		const owner = this.preparationOwner;
+		if (!owner) return;
+		if (permit !== owner) throw new Error("Host execution is reserved by a preparation-only turn");
+		if (owner.aborted) throw new Error("Preparation aborted before dispatch");
+		owner.assertCurrent?.();
+	}
+
+	private preparationContextKey(): string {
+		// Metadata-only entries may be appended by normal input hooks. Bind the
+		// actual conversation branch, not labels or telemetry entries.
+		return JSON.stringify(this.host.sessionManager.getBranch()
+			.filter(entry => ["message", "custom_message", "compaction", "branch_summary"].includes(entry.type))
+			.map(entry => entry.id));
+	}
+
+	private isPreparationCommand(text: string): boolean {
+		const name = /^\s*\/(\S+)/.exec(text)?.[1];
+		return !!name && !!this.host._extensionRunner.getCommand(name)?.preparation;
+	}
+
+	private async runPreparationCommand(options: PreparationCommandOptions, args: string): Promise<void> {
+		this.assertPreparationAccess();
+		// signal outlives isStreaming: it remains set while agent_end listeners settle.
+		if (this.promptsInFlight > 1 || this.host.agent.signal || this.host.agent.hasQueuedMessages() || this.host.pendingMessageCount ||
+			this.host._pendingNextTurnMessages.length || this.host._pendingBashMessages.length ||
+			this.host.isCompacting || this.host._retryAbortController || this.host._bashAbortController ||
+			this.host._branchSummaryAbortController) {
+			throw new Error("Host-entry refused: active or pending host work");
+		}
+		const guard = this.host._extensionRunner.getPreparationGuard(options.guard);
+		if (!guard) throw new Error(`Host-entry unverified: missing preparation guard ${options.guard}`);
+		const owner: NonNullable<AgentSessionPromptModule["preparationOwner"]> = { aborted: false, dispatched: false };
+		this.preparationOwner = owner;
+		let lease: PreparationLease | undefined;
+		try {
+			const admission = guard.acquire(this.host._extensionRunner.createCommandContext());
+			if (admission.admitted !== true) {
+				throw new Error(`Host-entry refused: ${admission.reason || "invalid guard response"}`);
+			}
+			lease = admission.lease;
+			if (typeof lease?.assertCurrent !== "function" || typeof lease?.release !== "function") {
+				throw new Error("Host-entry unverified: invalid preparation lease");
+			}
+			const initialContext = this.preparationContextKey();
+			const activeLease = lease;
+			owner.assertCurrent = () => {
+				activeLease.assertCurrent(this.host._extensionRunner.createCommandContext());
+				if (!owner.dispatched && this.preparationContextKey() !== initialContext) {
+					throw new Error("Preparation conversation changed before dispatch");
+				}
+			};
+			const prompt = await options.prepare(args, this.host._extensionRunner.createCommandContext());
+			this.assertPreparationAccess(owner);
+			if (typeof prompt !== "string" || !prompt.trim()) throw new Error("Preparation prompt must be nonempty text");
+			await this.prompt(prompt, { source: "extension", expandPromptTemplates: false }, owner);
+			lease.assertCurrent(this.host._extensionRunner.createCommandContext());
+		} finally {
+			// runAgentPrompt awaits the agent and ALL awaited agent_end listeners.
+			// Never delegate lease release to an extension's agent_end callback.
+			try { lease?.release(); } finally { if (this.preparationOwner === owner) this.preparationOwner = undefined; }
+		}
+	}
 
 	constructor(readonly host: AgentSessionHost) {}
 
-	async runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	async runAgentPrompt(messages: AgentMessage | AgentMessage[], permit?: object): Promise<void> {
+		this.assertPreparationAccess(permit);
+		if (this.preparationOwner && permit === this.preparationOwner) this.preparationOwner.dispatched = true;
 		const previousLatencyMark = this.host.agent.latencyMark;
 		this.host.agent.latencyMark = (phase, data) => {
 			previousLatencyMark?.(phase, data);
@@ -34,6 +103,7 @@ export class AgentSessionPromptModule {
 		try {
 			await this.host.agent.prompt(messages);
 			while (await this.handlePostAgentRun()) {
+				this.assertPreparationAccess(permit);
 				await this.host.agent.continue();
 			}
 		} finally {
@@ -66,7 +136,14 @@ export class AgentSessionPromptModule {
 		return await this.host.checkCompaction(msg);
 	}
 
-	async prompt(text: string, options?: PromptOptions): Promise<void> {
+	async prompt(text: string, options?: PromptOptions, permit?: object): Promise<void> {
+		this.assertPreparationAccess(permit);
+		this.promptsInFlight++;
+		try { await this.dispatchPrompt(text, options, permit); }
+		finally { this.promptsInFlight--; }
+	}
+
+	private async dispatchPrompt(text: string, options?: PromptOptions, permit?: object): Promise<void> {
 		const source = options?.source ?? "interactive";
 		const latency = this.host.beginTurnLatency({ source, trigger: "session.prompt" });
 		let latencyStatus: "completed" | "queued" | "handled" | "error" = "completed";
@@ -82,7 +159,7 @@ export class AgentSessionPromptModule {
 			});
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
-			if (expandPromptTemplates && text.startsWith("/")) {
+			if ((expandPromptTemplates && text.startsWith("/")) || this.isPreparationCommand(text)) {
 				this.host.markTurnLatency("session.extension_command.start");
 				const handled = await this.tryExecuteExtensionCommand(text);
 				if (handled) {
@@ -127,6 +204,15 @@ export class AgentSessionPromptModule {
 				this.host.markTurnLatency("session.prompt_expansion.end", {
 					changed: expandedText !== currentText,
 				});
+			}
+
+			// Input handlers/templates may produce a guarded command. Neither that
+			// route nor expandPromptTemplates:false may turn it into an unguarded prompt.
+			if (this.isPreparationCommand(expandedText)) {
+				await this.tryExecuteExtensionCommand(expandedText);
+				latencyStatus = "handled";
+				preflightResult?.(true);
+				return;
 			}
 
 			// If streaming, queue via steer() or followUp() based on option
@@ -259,7 +345,7 @@ export class AgentSessionPromptModule {
 		preflightResult?.(true);
 		try {
 			this.host.markTurnLatency("session.agent_run.start", { messages: messages.length });
-			await this.runAgentPrompt(messages);
+			await this.runAgentPrompt(messages, permit);
 			this.host.markTurnLatency("session.agent_run.end");
 		} catch (error) {
 			latencyStatus = "error";
@@ -273,10 +359,12 @@ export class AgentSessionPromptModule {
 	}
 
 	async tryExecuteExtensionCommand(text: string): Promise<boolean> {
-		// Parse command name and args
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+		this.assertPreparationAccess();
+		// Match whitespace consistently with guarded-command detection.
+		const parsed = /^\s*\/(\S+)(?:\s+([\s\S]*))?$/.exec(text);
+		if (!parsed) return false;
+		const commandName = parsed[1]!;
+		const args = parsed[2] ?? "";
 
 		const command = this.host._extensionRunner.getCommand(commandName);
 		if (!command) return false;
@@ -285,7 +373,8 @@ export class AgentSessionPromptModule {
 		const ctx = this.host._extensionRunner.createCommandContext();
 
 		try {
-			await command.handler(args, ctx);
+			if (command.preparation) await this.runPreparationCommand(command.preparation, args);
+			else await command.handler(args, ctx);
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
@@ -351,6 +440,8 @@ export class AgentSessionPromptModule {
 	}
 
 	async queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		this.assertPreparationAccess();
+		if (this.isPreparationCommand(text)) throw new Error("Preparation commands cannot be queued; invoke directly when idle");
 		this.host._steeringMessages.push(text);
 		this.host.emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -365,6 +456,8 @@ export class AgentSessionPromptModule {
 	}
 
 	async queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		this.assertPreparationAccess();
+		if (this.isPreparationCommand(text)) throw new Error("Preparation commands cannot be queued; invoke directly when idle");
 		this.host._followUpMessages.push(text);
 		this.host.emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -394,6 +487,9 @@ export class AgentSessionPromptModule {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		// Even a non-triggering message mutates conversation history. Preparation
+		// owns that history while its async callback runs, before streaming begins.
+		this.assertPreparationAccess();
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -477,6 +573,7 @@ export class AgentSessionPromptModule {
 	}
 
 	async abort(origin?: AgentAbortOrigin): Promise<void> {
+		if (this.preparationOwner) this.preparationOwner.aborted = true;
 		this.abortRetry();
 		this.host.agent.abort(origin);
 		await this.host.agent.waitForIdle();

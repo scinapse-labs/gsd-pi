@@ -5,6 +5,7 @@ import { Type } from "@sinclair/typebox";
 import type { ExtensionAPI } from "@gsd/pi-coding-agent";
 
 import { getAutoRuntimeSnapshot } from "../auto-runtime-state.js";
+import { preparationFence } from "../preparation-fence.js";
 import { scheduleAutoWakeup } from "../auto/schedule-wakeup.js";
 import { logWarning } from "../workflow-logger.js";
 import { resolveCtxCwd } from "./dynamic-tools.js";
@@ -21,6 +22,7 @@ export const CLAUDE_CODE_NATIVE_SCHEDULE_WAKEUP_TOOL_NAME = "ScheduleWakeup";
 // only that session's prior timer, so repeated polling never stacks overlapping
 // wakeups, and concurrent projects in one host process don't cancel each other.
 const pendingInteractiveWakeups = new Map<string, ReturnType<typeof setTimeout>>();
+export function hasPendingInteractiveWakeups(): boolean { return pendingInteractiveWakeups.size > 0; }
 
 function scheduleInteractiveWakeup(
   pi: ExtensionAPI,
@@ -29,6 +31,7 @@ function scheduleInteractiveWakeup(
   prompt: string,
   reason: string,
 ): void {
+  preparationFence.assertExecutionAllowed();
   const existing = pendingInteractiveWakeups.get(key);
   if (existing) clearTimeout(existing);
 

@@ -93,6 +93,10 @@ export type {
 	ExtensionActions,
 	// API
 	ExtensionAPI,
+	PreparationGuard,
+	PreparationLease,
+	PreparationAdmission,
+	PreparationCommandOptions,
 	ExtensionCommandContext,
 	ExtensionCommandContextActions,
 	ExtensionContext,

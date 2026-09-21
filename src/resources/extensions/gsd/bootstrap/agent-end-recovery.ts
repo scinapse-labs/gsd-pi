@@ -883,12 +883,10 @@ export async function handleAgentEnd(
         const attempt = retryState.networkRetryCount;
         const delayMs = attempt * cls.retryAfterMs;
         ctx.ui.notify(`Network error on ${currentModelId}${errorDetail}. Retry ${attempt}/${MAX_NETWORK_RETRIES} in ${delayMs / 1000}s...`, "warning");
-        setTimeout(() => {
-          pi.sendMessage(
-            { customType: "gsd-auto-timeout-recovery", content: "Continue execution — retrying after transient network error.", display: false },
-            { triggerTurn: true },
-          );
-        }, delayMs);
+        scheduleFallbackContinuation(pi, {
+          delayMs,
+          content: "Continue execution — retrying after transient network error.",
+        });
         return;
       }
       // Network retries exhausted — fall through to model fallback

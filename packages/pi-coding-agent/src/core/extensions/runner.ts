@@ -39,6 +39,7 @@ import type {
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
+	PreparationGuard,
 	RegisteredTool,
 	ReplacedSessionContext,
 	ResolvedCommand,
@@ -437,6 +438,16 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	/** Fail closed if more than one loaded extension claims the same provider. */
+	getPreparationGuard(name: string): PreparationGuard | undefined {
+		const matches = this.extensions.flatMap(ext => {
+			const guard = ext.preparationGuards?.get(name);
+			return guard ? [guard] : [];
+		});
+		if (matches.length > 1) throw new Error(`Ambiguous preparation guard: ${name}`);
+		return matches[0];
+	}
+
 	getFlags(): Map<string, ExtensionFlag> {
 		const allFlags = new Map<string, ExtensionFlag>();
 		for (const ext of this.extensions) {
@@ -612,7 +623,17 @@ export class ExtensionRunner {
 	}
 
 	getCommand(name: string): ResolvedCommand | undefined {
-		return this.resolveRegisteredCommands().find((command) => command.invocationName === name);
+		const commands = this.resolveRegisteredCommands();
+		const command = commands.find(candidate => candidate.invocationName === name);
+		const baseName = command?.name ?? name;
+		const protectedCommands = this.extensions.flatMap(extension => {
+			const candidate = extension.commands.get(baseName);
+			return candidate?.preparation ? [candidate] : [];
+		});
+		if (protectedCommands.length && (!command?.preparation || protectedCommands.length !== 1)) {
+			throw new Error(`Ambiguous or shadowed preparation command: ${baseName}`);
+		}
+		return command;
 	}
 
 	/**

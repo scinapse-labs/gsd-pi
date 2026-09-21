@@ -116,6 +116,7 @@ import {
 } from "./pending-auto-start.js";
 import { clearGuidedUnitContext, setGuidedUnitContext } from "./guided-unit-context.js";
 import { checkAutoStartAfterDiscuss, scheduleAutoStartAfterIdle } from "./discussion-handoff.js";
+import { preparationFence } from "./preparation-fence.js";
 import { resolveSubagentRoleForProvider } from "./subagent-role-resolver.js";
 export {
   maybeHandleEmptyIntentTurn,
@@ -424,6 +425,9 @@ interface PendingDeepProjectSetupEntry {
 }
 
 const pendingDeepProjectSetupMap = new Map<string, PendingDeepProjectSetupEntry>();
+export function hasPendingDeepProjectSetup(): boolean {
+  return pendingDeepProjectSetupMap.size > 0;
+}
 const USER_DRIVEN_DEEP_SETUP_UNITS = new Set([
   "discuss-project",
   "discuss-requirements",
@@ -541,6 +545,12 @@ export async function startDeepProjectSetupForeground(
   basePath: string,
   step?: boolean,
 ): Promise<void> {
+  return preparationFence.runExecution("deep-project-setup", () =>
+    startDeepProjectSetupImplementation(ctx, pi, basePath, step));
+}
+
+async function startDeepProjectSetupImplementation(...args: Parameters<typeof startDeepProjectSetupForeground>): Promise<void> {
+  const [ctx, pi, basePath, step] = args;
   const entry: PendingDeepProjectSetupEntry = {
     ctx,
     pi,
@@ -773,6 +783,7 @@ async function dispatchWorkflow(
   unitType?: string,
   options?: DispatchWorkflowOptions,
 ): Promise<void> {
+  return preparationFence.runExecution("guided-workflow-dispatch", async () => {
   const resolvedOptions = options ?? {};
   const projectRoot = resolveGuidedDispatchProjectRoot(resolvedOptions.basePath);
   const loadPreferences = resolvedOptions.deps?.loadPreferences ?? loadEffectiveGSDPreferences;
@@ -899,6 +910,7 @@ async function dispatchWorkflow(
     // before_agent_start (#3628, skill token savings).
     restoreGsdWorkflowTools(pi, savedTools);
   }
+  });
 }
 
 export const _dispatchWorkflowForTest = dispatchWorkflow;

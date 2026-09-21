@@ -3,6 +3,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent";
 
 import { registerExitCommand } from "../exit-command.js";
+import { preparationFence } from "../preparation-fence.js";
+import { registerPreparationGuard } from "./preparation-guard.js";
 import { registerLazyWorktreeCommands } from "../worktree-command-bootstrap.js";
 import type { GSDEcosystemBeforeAgentStartHandler } from "../ecosystem/gsd-extension-api.js";
 import { registerDbTools } from "./db-tools.js";
@@ -223,6 +225,7 @@ export function registerGsdExtension(pi: ExtensionAPI): void {
 
   // Wrap non-critical registrations individually so one failure
   // doesn't prevent the others from loading.
+  const bootstrapFailures: string[] = [];
   const nonCriticalRegistrations: Array<[string, () => void]> = [
     ["dynamic-tools", () => registerDynamicTools(pi)],
     ["db-tools", () => registerDbTools(pi)],
@@ -238,14 +241,16 @@ export function registerGsdExtension(pi: ExtensionAPI): void {
     ["cmux-events", () => initCmuxEventListeners(pi.events)],
     ["hooks", () => registerHooks(pi, ecosystemHandlers)],
     ["ecosystem", () => {
+      const reservation = preparationFence.reserveExecution("ecosystem-initialization");
       void import("../ecosystem/loader.js")
         .then(({ loadEcosystemExtensions }) => loadEcosystemExtensions(pi, ecosystemHandlers))
         .catch((err) => {
+          bootstrapFailures.push("ecosystem");
           logWarning(
             "ecosystem",
             `loader failed: ${err instanceof Error ? err.message : String(err)}`,
           );
-        });
+        }).finally(() => reservation.release());
     }],
   ];
 
@@ -253,6 +258,7 @@ export function registerGsdExtension(pi: ExtensionAPI): void {
     try {
       register();
     } catch (err) {
+      bootstrapFailures.push(name);
       logWarning(
         "bootstrap",
         `Failed to register ${name}: ${err instanceof Error ? err.message : String(err)}`,
@@ -261,4 +267,5 @@ export function registerGsdExtension(pi: ExtensionAPI): void {
   }
 
   assertCriticalGsdWorkflowToolsRegistered(pi);
+  registerPreparationGuard(pi, () => bootstrapFailures);
 }

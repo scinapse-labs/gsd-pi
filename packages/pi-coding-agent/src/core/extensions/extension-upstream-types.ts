@@ -1140,12 +1140,33 @@ export type MessageRenderer<T = unknown> = (
 // Command Registration
 // ============================================================================
 
+/** Host-only preparation admission; never a model-callable or serialized capability. */
+export interface PreparationLease {
+	assertCurrent(ctx: ExtensionCommandContext): void;
+	release(): void;
+}
+export type PreparationAdmission =
+	| { admitted: false; reason: string }
+	| { admitted: true; lease: PreparationLease };
+export interface PreparationGuard {
+	/** Synchronous: check and reserve without yielding to another admission. */
+	acquire(ctx: ExtensionCommandContext): PreparationAdmission;
+}
+export interface PreparationCommandOptions {
+	description?: string;
+	guard: string;
+	/** Called only after host admission. Return plain prompt content, not another command. */
+	prepare(args: string, ctx: ExtensionCommandContext): Promise<string>;
+}
+
 export interface RegisteredCommand {
 	name: string;
 	sourceInfo: SourceInfo;
 	description?: string;
 	getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[] | null | Promise<AutocompleteItem[] | null>;
 	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+	/** Dispatched by the host with a lease spanning the awaited agent run. */
+	preparation?: PreparationCommandOptions;
 }
 
 export interface ResolvedCommand extends RegisteredCommand {
@@ -1265,6 +1286,11 @@ export interface ExtensionAPI {
 
 	/** Register a custom command. */
 	registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void;
+
+	/** Capability v1: register a host-owned preparation admission provider. */
+	registerPreparationGuard(name: string, guard: PreparationGuard): void;
+	/** Capability v1: register a command whose entire turn requires that provider. */
+	registerPreparationCommand(name: string, options: PreparationCommandOptions): void;
 
 	/** Register a keyboard shortcut. */
 	registerShortcut(
@@ -1712,6 +1738,7 @@ export interface Extension {
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
 	runtimeReadHandlers: Map<string, RuntimeReadHandler>;
+	preparationGuards?: Map<string, PreparationGuard>;
 	/** GSD: npm package lifecycle hooks registered by extensions. */
 	lifecycleHooks?: LifecycleHookMap;
 }
