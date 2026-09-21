@@ -49,6 +49,7 @@ import {
 // callers — production wiring previously injected them via deps; the seam
 // added type churn without enabling test variation.
 import { loadEffectiveGSDPreferences, getIsolationMode } from "./preferences.js";
+import { loadUokFlags } from "./uok/flags.js";
 import { isolationDegradedFallbackGuidance, worktreeCreationFailedGuidance } from "./guidance.js";
 import { invalidateAllCaches } from "./cache.js";
 import { resolveMilestoneFile } from "./paths.js";
@@ -804,10 +805,9 @@ export function _enterMilestoneCore(
   // in use by another worktree". The override clears when the recovered
   // milestone merges (_mergeAndExit), restoring configured isolation for
   // subsequent milestones.
-  const mode =
-    opts.modeOverride ??
-    s.strandedRecoveryIsolationMode ??
-    getIsolationMode(basePath);
+  const mode = loadUokFlags(basePath).gitops
+    ? (opts.modeOverride ?? s.strandedRecoveryIsolationMode ?? getIsolationMode(basePath))
+    : "none";
 
   if (s.isolationDegraded) {
     if (mode === "worktree" || mode === "branch") {
@@ -1450,6 +1450,12 @@ export function mergeMilestoneStandalone(
     );
   }
 
+  const projectRoot = resolveWorktreeProjectRoot(worktreeBasePath, originalBasePath);
+  if (!loadUokFlags(projectRoot).gitops) {
+    debugLog("WorktreeLifecycle", { action: "mergeAndExit", milestoneId, skipped: true, reason: "gitops-disabled" });
+    return { merged: false, mode: "skipped", codeFilesChanged: false, pushed: false };
+  }
+
   if (mctx.isolationDegraded) {
     if (originalBasePath) {
       try {
@@ -1634,6 +1640,13 @@ export class WorktreeLifecycle {
     },
     ctx: NotifyCtx,
   ): ExitResult {
+    const projectRoot = resolveWorktreeProjectRoot(this.s.basePath, this.s.originalBasePath);
+    if (!loadUokFlags(projectRoot).gitops) {
+      // Guard before preflight: it can stash dirty work even if the merge skips.
+      debugLog("WorktreeLifecycle", { action: "exitMilestone", milestoneId, skipped: true, reason: "gitops-disabled" });
+      this.restoreToProjectRoot();
+      return { ok: true, merged: false, codeFilesChanged: false };
+    }
     if (opts.merge && opts.guardedMerge) {
       return runGuardedMilestoneMerge({
         merge: () => this.exitMilestone(milestoneId, { merge: true }, ctx),
@@ -2011,6 +2024,10 @@ export class WorktreeLifecycle {
       this.s.basePath,
       this.s.originalBasePath,
     );
+    if (!loadUokFlags(basePath).gitops) {
+      debugLog("WorktreeLifecycle", { action: "degradeToBranchMode", milestoneId, skipped: true, reason: "gitops-disabled" });
+      return;
+    }
     try {
       lifecycleEnterBranchMode(this.deps, basePath, milestoneId);
       rebuildGitService(this.s, this.deps);
@@ -2111,7 +2128,9 @@ export class WorktreeLifecycle {
     base: string,
     persistedWorktreePath: string | null,
   ): void {
-    this.s.basePath = resolvePausedResumeBasePath(base, persistedWorktreePath);
+    const gitopsEnabled = loadUokFlags(base).gitops;
+    this.s.basePath = resolvePausedResumeBasePath(base, gitopsEnabled ? persistedWorktreePath : null);
+    if (!gitopsEnabled) this.s.strandedRecoveryIsolationMode = null;
   }
 
   /**
@@ -2128,7 +2147,7 @@ export class WorktreeLifecycle {
     opts: StrandedMilestoneAdoptionOptions,
   ): EnterResult {
     this.adoptSessionRoot(base);
-    this.s.strandedRecoveryIsolationMode = opts.mode;
+    this.s.strandedRecoveryIsolationMode = loadUokFlags(base).gitops ? opts.mode : null;
     const result = _enterMilestoneCore(this.s, this.deps, milestoneId, ctx, {
       modeOverride: opts.mode,
     });

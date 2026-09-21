@@ -13,6 +13,7 @@ import { externalGsdRoot, externalStateAlreadyExistsForProject, isInsideWorktree
 import { getErrorMessage } from "./error-utils.js";
 import { hasGitTrackedGsdFiles } from "./gitignore.js";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
+import { loadUokFlags } from "./uok/flags.js";
 import { gsdRoot, milestonesDir, resolveGsdRootFile } from "./paths.js";
 
 export interface MigrationResult {
@@ -51,6 +52,11 @@ export function migrateToExternalState(basePath: string): MigrationResult {
   // rename and the copy leaves `.gsd` missing and migration permanently
   // skipped by the "doesn't exist" guard below.
   recoverFailedMigration(basePath);
+
+  // Replacing a directory with a symlink changes Git's working-tree view:
+  // a common `.gsd/` ignore rule no longer matches it. An external Git owner
+  // must choose that migration (and any ignore/index updates) explicitly.
+  if (!loadUokFlags(basePath).gitops) return { migrated: false };
 
   const localGsd = join(basePath, ".gsd");
 

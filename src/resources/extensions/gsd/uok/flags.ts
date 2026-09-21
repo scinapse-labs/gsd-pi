@@ -39,7 +39,7 @@ export function resolveUokFlags(prefs: GSDPreferences | undefined): UokFlags {
   };
 }
 
-export function loadUokFlags(): UokFlags {
-  const prefs = loadEffectiveGSDPreferences()?.preferences;
+export function loadUokFlags(basePath?: string): UokFlags {
+  const prefs = loadEffectiveGSDPreferences(basePath)?.preferences;
   return resolveUokFlags(prefs);
 }

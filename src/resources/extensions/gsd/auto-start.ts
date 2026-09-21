@@ -28,6 +28,7 @@ import {
   resolveSkillDiscoveryMode,
   getIsolationMode,
 } from "./preferences.js";
+import { loadUokFlags } from "./uok/flags.js";
 import { ensureGsdSymlink, isInheritedRepo, validateProjectId } from "./repo-identity.js";
 import { migrateToExternalState, recoverFailedMigration } from "./migrate-external.js";
 import { collectSecretsFromManifest } from "../get-secrets-from-user.js";
@@ -193,6 +194,53 @@ export function reconcileFlatPhaseBootstrapLayout(basePath: string): boolean {
   return false;
 }
 
+/** Git preparation is optional even when starting in a non-repository directory. */
+export function initializeAutoSessionRepo(basePath: string): void {
+  if (!loadUokFlags(basePath).gitops) return;
+  if (!existsSync(join(basePath, ".git")) || isInheritedRepo(basePath)) {
+    const mainBranch = loadEffectiveGSDPreferences(basePath)?.preferences?.git?.main_branch || "main";
+    nativeInit(basePath, mainBranch);
+  }
+}
+
+export function prepareAutoSessionGitignore(basePath: string): void {
+  if (!loadUokFlags(basePath).gitops) return;
+  const manageGitignore = loadEffectiveGSDPreferences(basePath)?.preferences?.git?.manage_gitignore;
+  ensureGitignore(basePath, { manageGitignore });
+  if (manageGitignore !== false) untrackRuntimeFiles(basePath);
+}
+
+export function recoverAutoSessionBranch(basePath: string, hasStrandedWork: boolean): void {
+  if (!loadUokFlags(basePath).gitops || hasStrandedWork) return;
+  const isolationMode = getIsolationMode(basePath);
+  const isRepo = nativeIsRepo(basePath);
+  if (isolationMode !== "none" || !isRepo) return;
+  try {
+    const currentBranch = nativeGetCurrentBranch(basePath);
+    const integrationBranch = nativeDetectMainBranch(basePath);
+    const branchToCheckout = resolveIsolationNoneBranchCheckout(currentBranch, integrationBranch, isolationMode, isRepo);
+    if (branchToCheckout) {
+      checkoutBranchWithStashGuard(basePath, branchToCheckout, "isolation-none-recovery");
+      logWarning("bootstrap", `Returned to "${branchToCheckout}" — HEAD was on stale milestone branch "${currentBranch}" (isolation: none does not use milestone branches).`);
+    }
+  } catch (err) {
+    logWarning("bootstrap", `Could not auto-checkout from stale milestone branch: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Reconcile projections even when the host owns all Git mutations. */
+export function bootstrapAutoSessionLayout(basePath: string): void {
+  if (!reconcileFlatPhaseBootstrapLayout(basePath)) return;
+  if (!loadUokFlags(basePath).gitops) return;
+
+  try {
+    nativeAddAll(basePath);
+    nativeCommit(basePath, "chore: init gsd");
+  } catch (err) {
+    logWarning("engine", `layout bootstrap commit failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export function _shouldAbortBootstrapForUnavailableDbForTest(
   gsdDbPath: string,
   dbAvailable: boolean,
@@ -333,7 +381,9 @@ export function decideSurvivorAction(
 export function resolveSurvivorRecoveryIsolationMode(
   isolationMode: "worktree" | "branch" | "none",
   phase: string | null | undefined,
+  gitopsEnabled = true,
 ): "worktree" | "branch" | "none" {
+  if (!gitopsEnabled) return "none";
   if (isolationMode === "none" && phase === "complete") return "branch";
   return isolationMode;
 }
@@ -491,6 +541,10 @@ export function auditOrphanedMilestoneBranches(
   const recovered: string[] = [];
   const warnings: string[] = [];
   const actions: OrphanAuditAction[] = [];
+  // Cleanup and stranded-work adoption both belong to the configured Git owner.
+  if (!loadUokFlags(basePath).gitops) {
+    return { recovered, warnings, actions, blockingStrandedWork: null };
+  }
   const branchList = gitDeps.branchList ?? nativeBranchList;
   const branchExists = gitDeps.branchExists ?? nativeBranchExists;
   const hasChanges = gitDeps.hasChanges ?? nativeHasChanges;
@@ -1201,17 +1255,17 @@ export async function bootstrapAutoSession(
     // its own. Check for a local .git instead (defense-in-depth for the case
     // where isInheritedRepo() returns a false negative, e.g. stale .gsd at
     // the parent git root). See #2393 and related issue.
-    const hasLocalGit = existsSync(join(base, ".git"));
-    if (!hasLocalGit || isInheritedRepo(base)) {
-      const mainBranch =
-        loadEffectiveGSDPreferences(base)?.preferences?.git?.main_branch || "main";
-      nativeInit(base, mainBranch);
+    // Restore interrupted migration preferences before resolving Git authority.
+    recoverFailedMigration(base);
+    const gitopsEnabled = loadUokFlags(base).gitops;
+    if (!gitopsEnabled) {
+      debugLog("gitops-disabled-startup", { gitMutations: "skipped", stateMigration: "skipped", isolation: "none" });
     }
+    initializeAutoSessionRepo(base);
 
     // Migrate legacy in-project .gsd/ to external state directory.
     // Migration MUST run before ensureGitignore to avoid adding ".gsd" to
     // .gitignore when .gsd/ is git-tracked (data-loss bug #1364).
-    recoverFailedMigration(base);
     // startAuto's interrupted-session assessment may already have opened the
     // database. Retire every handle before migration moves the containing
     // directory so the WAL is checkpointed and no cached adapter remains
@@ -1226,7 +1280,8 @@ export async function bootstrapAutoSession(
       ctx.ui.notify(`External state migration warning: ${migration.error}`, severity);
     }
     // Ensure symlink exists (handles fresh projects and post-migration)
-    ensureGsdSymlink(base);
+    // Without Git ownership, keep local state local (including directory ignore rules).
+    if (gitopsEnabled) ensureGsdSymlink(base);
 
     // Acquisition starts before migration so bootstrap is serialized. Once
     // .gsd points at external state, hand ownership to that physical target
@@ -1242,21 +1297,10 @@ export async function bootstrapAutoSession(
     // Ensure .gitignore has baseline patterns.
     // ensureGitignore checks for git-tracked .gsd/ files and skips the
     // ".gsd" pattern if the project intentionally tracks .gsd/ in git.
-    const gitPrefs = loadEffectiveGSDPreferences(base)?.preferences?.git;
-    const manageGitignore = gitPrefs?.manage_gitignore;
-    ensureGitignore(base, { manageGitignore });
-    if (manageGitignore !== false) untrackRuntimeFiles(base);
+    prepareAutoSessionGitignore(base);
 
     // Bootstrap the flat-phase projection root and clean empty legacy scaffolds.
-    if (reconcileFlatPhaseBootstrapLayout(base)) {
-      try {
-        nativeAddAll(base);
-        nativeCommit(base, "chore: init gsd");
-      } catch (err) {
-        /* nothing to commit */
-        logWarning("engine", `layout bootstrap commit failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    bootstrapAutoSessionLayout(base);
 
     {
       const { prepareWorkflowMcpForProject } = await import("./workflow-mcp-auto-prep.js");
@@ -1400,7 +1444,7 @@ export async function bootstrapAutoSession(
     // Stale worktree state recovery (#654)
     if (
       state.activeMilestone &&
-      shouldUseWorktreeIsolation(base) &&
+      gitopsEnabled && shouldUseWorktreeIsolation(base) &&
       !detectWorktreeName(base)
     ) {
       const wtPath = getAutoWorktreePath(base, state.activeMilestone.id);
@@ -1478,7 +1522,7 @@ export async function bootstrapAutoSession(
     let hasSurvivorBranch = false;
     let survivorMilestoneId = state.activeMilestone?.id ?? null;
     const configuredIsolationMode = getIsolationMode(base);
-    const survivorIsolationMode = resolveSurvivorRecoveryIsolationMode(configuredIsolationMode, state.phase);
+    const survivorIsolationMode = resolveSurvivorRecoveryIsolationMode(configuredIsolationMode, state.phase, gitopsEnabled);
     if (!survivorMilestoneId && state.phase === "complete") {
       survivorMilestoneId = findUnmergedCompletedMilestone(base, survivorIsolationMode);
     }
@@ -1748,7 +1792,7 @@ export async function bootstrapAutoSession(
 
     // Capture integration branch
     if (s.currentMilestoneId) {
-      if (getIsolationMode(base) !== "none" || strandedRecoveryAction) {
+      if (gitopsEnabled && (getIsolationMode(base) !== "none" || strandedRecoveryAction)) {
         captureIntegrationBranch(base, s.currentMilestoneId);
       }
       setActiveMilestoneId(base, s.currentMilestoneId);
@@ -1757,26 +1801,7 @@ export async function bootstrapAutoSession(
     // Guard against stale milestone branch when isolation:none (#3613).
     // A prior session with isolation:branch/worktree may have left HEAD on
     // milestone/<MID>. Auto-checkout back to the integration branch.
-    const isolationMode = getIsolationMode(base);
-    const isRepo = nativeIsRepo(base);
-    if (isolationMode === "none" && isRepo && !strandedRecoveryAction) {
-      try {
-        const currentBranch = nativeGetCurrentBranch(base);
-        const integrationBranch = nativeDetectMainBranch(base);
-        const branchToCheckout = resolveIsolationNoneBranchCheckout(
-          currentBranch,
-          integrationBranch,
-          isolationMode,
-          isRepo,
-        );
-        if (branchToCheckout) {
-          checkoutBranchWithStashGuard(base, branchToCheckout, "isolation-none-recovery");
-          logWarning("bootstrap", `Returned to "${branchToCheckout}" — HEAD was on stale milestone branch "${currentBranch}" (isolation: none does not use milestone branches).`);
-        }
-      } catch (err) {
-        logWarning("bootstrap", `Could not auto-checkout from stale milestone branch: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    recoverAutoSessionBranch(base, !!strandedRecoveryAction);
 
     // ── Auto-worktree setup ──
     // s.originalBasePath was set to `base` by `adoptSessionRoot(base)` above
@@ -1793,7 +1818,7 @@ export async function bootstrapAutoSession(
     };
 
     if (
-      s.currentMilestoneId &&
+      gitopsEnabled && s.currentMilestoneId &&
       (getIsolationMode(base) !== "none" || strandedRecoveryAction?.recoveryMode) &&
       !detectWorktreeName(base) &&
       !isUnderGsdWorktrees(base)

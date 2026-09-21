@@ -4,6 +4,7 @@
 
 import { execFileSync } from "node:child_process";
 import { GIT_NO_PROMPT_ENV } from "./git-constants.js";
+import { loadUokFlags } from "./uok/flags.js";
 
 export interface OrphanPreflightStashAuditResult {
   applied: Array<{ milestoneId: string; stashRef: string }>;
@@ -124,6 +125,7 @@ export function auditOrphanedPreflightStashes(
   isMilestoneComplete: (milestoneId: string) => boolean,
 ): OrphanPreflightStashAuditResult {
   const result: OrphanPreflightStashAuditResult = { applied: [], warnings: [] };
+  if (!loadUokFlags(basePath).gitops) return result;
 
   let listOutput: string;
   try {
